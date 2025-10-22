@@ -12,6 +12,7 @@ LOG = logging.getLogger(__name__)
 
 COORDS: Mapping[str, str] = {"x": "WGS84_E", "y": "WGS84_N"}
 SAMPLES_FILENAME = "data/samples.csv"
+SAMPLES_GPKG_FILENAME = "samples.gpkg"
 CRS_FILENAME = "data/crs.wkt"
 RULES_FILENAME = "data/rules.json"
 
@@ -96,6 +97,16 @@ def stage_archeodata(in_path: Path, rules_path: Path, out_dir: Path):
 
 	samples_path = Path(out_dir) / SAMPLES_FILENAME
 	samples_df.to_csv(samples_path, index=False)
+
+	geometry = gpd.points_from_xy(samples_df["x"], samples_df["y"])
+	filtered_gdf = gpd.GeoDataFrame(
+		filtered.drop(columns="geometry", errors="ignore"),
+		geometry=geometry,
+		crs=gdf.crs,
+	)
+
+	gpkg_path = Path(out_dir) / SAMPLES_GPKG_FILENAME
+	filtered_gdf.to_file(gpkg_path, driver="GPKG", layer="samples")
 	
 	crs = gdf.crs
 	if crs is None:
