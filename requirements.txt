@@ -1,0 +1,5 @@
+geopandas
+pandas
+rasterio
+numpy
+affine
