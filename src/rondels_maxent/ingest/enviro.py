@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from pathlib import Path
 import logging
 import math
+
+from multiprocessing import Pool, cpu_count
 
 import numpy as np
 import rasterio
@@ -47,7 +49,11 @@ def _collect_geotiffs(enviro_dir: Path) -> List[Path]:
 	return sorted(paths)
 
 
-def _determine_cellsize(paths: List[Path], target_crs: CRS) -> float:
+def _determine_cellsize(
+	paths: List[Path],
+	target_crs: CRS,
+	min_cell_size: Optional[float] = None,
+) -> float:
 	min_cell = math.inf
 	for path in paths:
 		with rasterio.open(path) as src:
@@ -65,6 +71,32 @@ def _determine_cellsize(paths: List[Path], target_crs: CRS) -> float:
 
 	if not math.isfinite(min_cell) or min_cell <= 0:
 		raise ValueError("Failed to determine common output resolution for environmental layers.")
+
+	if min_cell_size is not None:
+		if min_cell_size <= 0:
+			raise ValueError("min_cell_size must be a positive value when provided.")
+
+		try:
+			unit_factor = target_crs.linear_units_factor  # meters per target unit
+		except (AttributeError, ValueError):
+			unit_factor = None
+
+		if unit_factor and math.isfinite(unit_factor) and unit_factor > 0:
+			min_in_target_units = min_cell_size / unit_factor
+		elif target_crs.is_geographic:
+			ellipsoid = getattr(target_crs, "ellipsoid", None)
+			if ellipsoid is None and getattr(target_crs, "geodetic_crs", None):
+				ellipsoid = target_crs.geodetic_crs.ellipsoid
+			radius = None
+			if ellipsoid is not None:
+				radius = getattr(ellipsoid, "mean_radius", None) or getattr(ellipsoid, "semi_major_metre", None)
+			if radius is None or radius <= 0:
+				radius = 6_371_008.7714  # authalic radius of Earth in meters
+			min_in_target_units = math.degrees(min_cell_size / radius)
+		else:
+			min_in_target_units = min_cell_size
+
+		min_cell = max(min_cell, min_in_target_units)
 
 	return min_cell
 
@@ -133,11 +165,76 @@ def _validate_existing(
 	return True
 
 
+def _resolve_nodata(value: Optional[float]) -> float:
+	if value is None:
+		return _DEFAULT_NODATA
+
+	try:
+		numeric = float(value)
+	except (TypeError, ValueError):
+		return _DEFAULT_NODATA
+
+	if math.isnan(numeric) or not math.isfinite(numeric):
+		return _DEFAULT_NODATA
+
+	return numeric
+
+
+def _stage_single_enviro(task: tuple[int, int, str, str, int, int, tuple[float, ...], str]) -> tuple[int, Path]:
+	index, total, tif_path_str, dst_path_str, width, height, dst_transform_gdal, target_crs_wkt = task
+
+	tif_path = Path(tif_path_str)
+	dst_path = Path(dst_path_str)
+	dst_transform = Affine.from_gdal(*dst_transform_gdal)
+	target_crs = CRS.from_wkt(target_crs_wkt)
+
+	LOG.info("Staging environmental data %d/%d from %s.", index, total, tif_path)
+
+	with rasterio.open(tif_path) as src:
+		if src.count != 1:
+			raise ValueError(f"Expected single-band raster, found {src.count} bands in {tif_path}")
+		if src.crs is None:
+			raise ValueError(f"Input raster missing CRS: {tif_path}")
+
+		src_nodata = src.nodata
+		dst_nodata = _resolve_nodata(src_nodata)
+		dst_data = np.full((height, width), dst_nodata, dtype=np.float32)
+
+		reproject(
+			source=rasterio.band(src, 1),
+			destination=dst_data,
+			src_transform=src.transform,
+			src_crs=src.crs,
+			dst_transform=dst_transform,
+			dst_crs=target_crs,
+			resampling=Resampling.bilinear,
+			src_nodata=src_nodata,
+			dst_nodata=dst_nodata,
+		)
+
+	with rasterio.open(
+		dst_path,
+		"w",
+		driver="AAIGrid",
+		width=width,
+		height=height,
+		count=1,
+		dtype=dst_data.dtype,
+		crs=target_crs,
+		transform=dst_transform,
+		nodata=dst_nodata,
+	) as dst:
+		dst.write(dst_data, 1)
+
+	return index, dst_path
+
+
 def stage_enviro(
 	enviro_dir: Path,
 	out_dir: Path,
 	upper_left: Tuple[float, float],
 	lower_right: Tuple[float, float],
+	min_cell_size: Optional[float] = None,
 ) -> List[Path]:
 	"""Reproject environmental rasters and export them in aligned ASCII grid format."""
 	enviro_dir = Path(enviro_dir)
@@ -152,55 +249,45 @@ def stage_enviro(
 
 	target_crs = _load_target_crs(out_dir)
 	geotiff_paths = _collect_geotiffs(enviro_dir)
-	cellsize = _determine_cellsize(geotiff_paths, target_crs)
+	cellsize = _determine_cellsize(geotiff_paths, target_crs, min_cell_size)
 	width, height, dst_transform, xllcorner, yllcorner = _calculate_grid(upper_left, lower_right, cellsize)
 
-	output_paths: List[Path] = []
+	output_paths_map: dict[int, Path] = {}
+	to_process: List[tuple[int, int, str, str, int, int, tuple[float, ...], str]] = []
 	total = len(geotiff_paths)
+	target_crs_wkt = target_crs.to_wkt()
+	dst_transform_gdal = dst_transform.to_gdal()
+
 	for index, tif_path in enumerate(geotiff_paths, start=1):
 		dst_path = asc_dir / f"{tif_path.stem}.asc"
 		if _validate_existing(dst_path, width, height, cellsize, xllcorner, yllcorner):
 			LOG.info("Skipping existing environmental layer %s.", dst_path)
-			output_paths.append(dst_path)
+			output_paths_map[index] = dst_path
 			continue
 
-		LOG.info("Staging environmental data %d/%d from %s.", index, total, tif_path)
-		with rasterio.open(tif_path) as src:
-			if src.count != 1:
-				raise ValueError(f"Expected single-band raster, found {src.count} bands in {tif_path}")
-			if src.crs is None:
-				raise ValueError(f"Input raster missing CRS: {tif_path}")
-
-			src_nodata = src.nodata
-			dst_nodata = float(src_nodata) if src_nodata is not None else _DEFAULT_NODATA
-			dst_data = np.full((height, width), dst_nodata, dtype=np.float32)
-
-			reproject(
-				source=rasterio.band(src, 1),
-				destination=dst_data,
-				src_transform=src.transform,
-				src_crs=src.crs,
-				dst_transform=dst_transform,
-				dst_crs=target_crs,
-				resampling=Resampling.bilinear,
-				src_nodata=src_nodata,
-				dst_nodata=dst_nodata,
+		to_process.append(
+			(
+				index,
+				total,
+				str(tif_path),
+				str(dst_path),
+				width,
+				height,
+				dst_transform_gdal,
+				target_crs_wkt,
 			)
+		)
 
-			with rasterio.open(
-				dst_path,
-				"w",
-				driver="AAIGrid",
-				width=width,
-				height=height,
-				count=1,
-				dtype=dst_data.dtype,
-				crs=target_crs,
-				transform=dst_transform,
-				nodata=dst_nodata,
-			) as dst:
-				dst.write(dst_data, 1)
+	if to_process:
+		available = cpu_count() or 1
+		processes = min(len(to_process), available)
 
-		output_paths.append(dst_path)
+		if processes > 1:
+			with Pool(processes=processes) as pool:
+				for idx, path in pool.map(_stage_single_enviro, to_process):
+					output_paths_map[idx] = path
+		else:
+			idx, path = _stage_single_enviro(to_process[0])
+			output_paths_map[idx] = path
 
-	return output_paths
+	return [output_paths_map[i] for i in range(1, total + 1)]

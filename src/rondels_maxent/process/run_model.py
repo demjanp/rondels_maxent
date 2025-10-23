@@ -110,11 +110,11 @@ def run_model(enviro_layers: List[Path], maxent_dir: Path):
 		f"samplesfile={str(samples_path.resolve())}",
 		f"outputdirectory={str(output_dir)}",
 		"jackknife=true",
-		"responsecurves=false",
+		"responsecurves=true",
 		"pictures=true",
 		"visible=false",
 		"plots=true",
-		"writebackgroundpredictions=false",
+		"writebackgroundpredictions=true",
 		"askoverwrite=false",
 		"autorun",
 	]

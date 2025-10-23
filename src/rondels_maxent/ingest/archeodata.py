@@ -14,7 +14,7 @@ COORDS: Mapping[str, str] = {"x": "WGS84_E", "y": "WGS84_N"}
 SAMPLES_FILENAME = "data/samples.csv"
 SAMPLES_GPKG_FILENAME = "samples.gpkg"
 CRS_FILENAME = "data/crs.wkt"
-RULES_FILENAME = "data/rules.json"
+RULES_FILENAME = "rules.json"
 
 def _load_rules(rules_path: Path) -> dict[str, list[str]]:
 	rules_path = Path(rules_path)
