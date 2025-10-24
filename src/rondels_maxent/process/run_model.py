@@ -3,10 +3,11 @@ from __future__ import annotations
 from typing import List
 from pathlib import Path
 import csv
+import shutil
 import logging
 import subprocess
 
-from ..ingest.archeodata import SAMPLES_FILENAME
+from ..ingest.archeodata import SAMPLES_FILENAME, CRS_FILENAME
 
 LOG = logging.getLogger(__name__)
 
@@ -87,14 +88,14 @@ def _prepare_maxent_paths(maxent_dir: Path) -> Path:
 	return jar_path
 
 
-def run_model(enviro_layers: List[Path], maxent_dir: Path):
+def run_model(enviro_layers: List[Path], maxent_dir: Path, out_dir: Path):
 	"""Execute MaxEnt model using prepared samples and environmental layers.
 
 	The ``maxent_dir`` parameter must point to the directory containing ``maxent.jar``.
 	"""
 	resolved_layers = _validate_env_layers(enviro_layers)
 	layer_dir = _ensure_single_parent(resolved_layers)
-	base_dir = _determine_base_dir(resolved_layers[0])
+	base_dir = Path(out_dir)
 	samples_path = _validate_samples_file(base_dir)
 	maxent_jar = _prepare_maxent_paths(maxent_dir)
 
@@ -125,3 +126,5 @@ def run_model(enviro_layers: List[Path], maxent_dir: Path):
 		subprocess.run(command, check=True, cwd=maxent_dir)
 	except subprocess.CalledProcessError as exc:
 		raise RuntimeError(f"MaxEnt execution failed with exit code {exc.returncode}") from exc
+	
+	shutil.copy((base_dir / CRS_FILENAME).resolve(), (base_dir / MAXENT_OUT_DIR / "site.prj").resolve())

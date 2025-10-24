@@ -13,7 +13,7 @@ LOG = logging.getLogger(__name__)
 COORDS: Mapping[str, str] = {"x": "WGS84_E", "y": "WGS84_N"}
 SAMPLES_FILENAME = "data/samples.csv"
 SAMPLES_GPKG_FILENAME = "samples.gpkg"
-CRS_FILENAME = "data/crs.wkt"
+CRS_FILENAME = "data/crs.prj"
 RULES_FILENAME = "rules.json"
 
 def _load_rules(rules_path: Path) -> dict[str, list[str]]:
@@ -113,7 +113,7 @@ def stage_archeodata(in_path: Path, rules_path: Path, out_dir: Path):
 		raise ValueError("Input dataset lacks a defined CRS.")
 
 	crs_path = Path(out_dir) / CRS_FILENAME
-	crs_path.write_text(crs.to_wkt(), encoding="utf-8")
+	crs_path.write_text(crs.to_wkt(version="WKT1_ESRI"), encoding="utf-8")
 	
 	output_rules_path = Path(out_dir) / RULES_FILENAME
 	output_rules_path.write_text(json.dumps(rules, indent=2, sort_keys=True), encoding="utf-8")

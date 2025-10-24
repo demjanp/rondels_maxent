@@ -49,7 +49,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 	stage_archeodata(in_path, rules_path, out_dir)
 	enviro_layers = stage_enviro(enviro_dir, out_dir, upper_left, lower_right, min_cell_size)
-	run_model(enviro_layers, maxent_dir)
+	run_model(enviro_layers, maxent_dir, out_dir)
 	
 	return 0
 
