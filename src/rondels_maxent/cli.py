@@ -21,6 +21,7 @@ def _build_parser() -> argparse.ArgumentParser:
 	p.add_argument("--ul", nargs=2, type=float, required=True, metavar=("UL_LON", "UL_LAT"))
 	p.add_argument("--lr", nargs=2, type=float, required=True, metavar=("LR_LON", "LR_LAT"))
 	p.add_argument("--min_cell_size", type=int, default=-1, required=False, help="Minimum cell size for background rasters in meters (-1 = automatic)")
+	p.add_argument("--categorical", nargs="+", metavar="LAYER", default=None, help="Layer names (without extension) to treat as categorical")
 	return p
 
 def _ensure_dir(p: Path) -> Path:
@@ -46,10 +47,18 @@ def main(argv: Optional[list[str]] = None) -> int:
 	maxent_dir = Path(ns.maxent)
 	upper_left, lower_right = tuple(ns.ul), tuple(ns.lr)
 	min_cell_size = None if ns.min_cell_size <= 0 else ns.min_cell_size
+	categorical = [name.strip() for name in ns.categorical] if ns.categorical else None
 
 	stage_archeodata(in_path, rules_path, out_dir)
-	enviro_layers = stage_enviro(enviro_dir, out_dir, upper_left, lower_right, min_cell_size)
-	run_model(enviro_layers, maxent_dir, out_dir)
+	enviro_layers = stage_enviro(
+		enviro_dir,
+		out_dir,
+		upper_left,
+		lower_right,
+		min_cell_size,
+		categorical_layers=categorical,
+	)
+	run_model(enviro_layers, maxent_dir, out_dir, categorical)
 	
 	return 0
 

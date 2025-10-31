@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional
 from pathlib import Path
 import csv
 import shutil
@@ -88,10 +88,20 @@ def _prepare_maxent_paths(maxent_dir: Path) -> Path:
 	return jar_path
 
 
-def run_model(enviro_layers: List[Path], maxent_dir: Path, out_dir: Path):
+def run_model(enviro_layers: List[Path], maxent_dir: Path, out_dir: Path, categorical: Optional[List[str]] = None):
 	"""Execute MaxEnt model using prepared samples and environmental layers.
 
-	The ``maxent_dir`` parameter must point to the directory containing ``maxent.jar``.
+	Parameters
+	----------
+	enviro_layers : list[Path]
+		Paths to environmental layer files (.asc, .tif, etc.)
+	maxent_dir : Path
+		Directory containing maxent.jar.
+	out_dir : Path
+		Base output directory.
+	categorical : list[str], optional
+		Names (without extension) of layers to treat as categorical.
+		Example: ['HWSD2', 'landcover']
 	"""
 	resolved_layers = _validate_env_layers(enviro_layers)
 	layer_dir = _ensure_single_parent(resolved_layers)
@@ -120,11 +130,21 @@ def run_model(enviro_layers: List[Path], maxent_dir: Path, out_dir: Path):
 		"autorun",
 	]
 
-	LOG.info("Running MaxEnt: %s", " ".join(command))
+	# Add categorical layers
+	if categorical:
+		unique_names = list(dict.fromkeys(categorical))  # preserve order, remove duplicates
+		LOG.info("Treating layers as categorical: %s", ", ".join(unique_names))
+		for name in unique_names:
+			command.append(f"togglelayertype={name}")
 
+	LOG.info("Running MaxEnt: %s", " ".join(command))
 	try:
 		subprocess.run(command, check=True, cwd=maxent_dir)
 	except subprocess.CalledProcessError as exc:
 		raise RuntimeError(f"MaxEnt execution failed with exit code {exc.returncode}") from exc
-	
-	shutil.copy((base_dir / CRS_FILENAME).resolve(), (base_dir / MAXENT_OUT_DIR / "site.prj").resolve())
+
+	# Copy CRS file for spatial context
+	shutil.copy(
+		(base_dir / CRS_FILENAME).resolve(),
+		(base_dir / MAXENT_OUT_DIR / "site.prj").resolve()
+	)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Tuple, Optional
+from typing import Iterable, List, Optional, Tuple
 from pathlib import Path
 import logging
 import math
@@ -180,8 +180,10 @@ def _resolve_nodata(value: Optional[float]) -> float:
 	return numeric
 
 
-def _stage_single_enviro(task: tuple[int, int, str, str, int, int, tuple[float, ...], str]) -> tuple[int, Path]:
-	index, total, tif_path_str, dst_path_str, width, height, dst_transform_gdal, target_crs_wkt = task
+def _stage_single_enviro(
+	task: tuple[int, int, str, str, int, int, tuple[float, ...], str, bool]
+) -> tuple[int, Path]:
+	index, total, tif_path_str, dst_path_str, width, height, dst_transform_gdal, target_crs_wkt, is_categorical = task
 
 	tif_path = Path(tif_path_str)
 	dst_path = Path(dst_path_str)
@@ -207,7 +209,7 @@ def _stage_single_enviro(task: tuple[int, int, str, str, int, int, tuple[float, 
 			src_crs=src.crs,
 			dst_transform=dst_transform,
 			dst_crs=target_crs,
-			resampling=Resampling.bilinear,
+			resampling=Resampling.nearest if is_categorical else Resampling.bilinear,
 			src_nodata=src_nodata,
 			dst_nodata=dst_nodata,
 		)
@@ -235,8 +237,24 @@ def stage_enviro(
 	upper_left: Tuple[float, float],
 	lower_right: Tuple[float, float],
 	min_cell_size: Optional[float] = None,
+	categorical_layers: Optional[Iterable[str]] = None,
 ) -> List[Path]:
-	"""Reproject environmental rasters and export them in aligned ASCII grid format."""
+	"""Reproject environmental rasters and export them in aligned ASCII grid format.
+
+	Parameters
+	----------
+	enviro_dir : Path
+		Directory containing source GeoTIFFs.
+	out_dir : Path
+		Workspace directory that will receive the ASCII outputs.
+	upper_left, lower_right : tuple[float, float]
+		AOI bounds (in target CRS coordinates).
+	min_cell_size : float, optional
+		Minimum cell size in meters; auto-calculated when omitted or <= 0.
+	categorical_layers : Iterable[str], optional
+		Names (without extension) of rasters to treat as categorical, resampled with
+		nearest neighbour to preserve class values.
+	"""
 	enviro_dir = Path(enviro_dir)
 	if not enviro_dir.exists():
 		raise FileNotFoundError(f"Enviro directory not found: {enviro_dir}")
@@ -249,18 +267,27 @@ def stage_enviro(
 
 	target_crs = _load_target_crs(out_dir)
 	geotiff_paths = _collect_geotiffs(enviro_dir)
+	categorical_lookup = {
+		name.lower(): name for name in categorical_layers or []
+	}
+	found_categorical: set[str] = set()
 	cellsize = _determine_cellsize(geotiff_paths, target_crs, min_cell_size)
 	width, height, dst_transform, xllcorner, yllcorner = _calculate_grid(upper_left, lower_right, cellsize)
 
 	output_paths_map: dict[int, Path] = {}
-	to_process: List[tuple[int, int, str, str, int, int, tuple[float, ...], str]] = []
+	to_process: List[tuple[int, int, str, str, int, int, tuple[float, ...], str, bool]] = []
 	total = len(geotiff_paths)
 	target_crs_wkt = target_crs.to_wkt()
 	dst_transform_gdal = dst_transform.to_gdal()
 
 	for index, tif_path in enumerate(geotiff_paths, start=1):
 		dst_path = asc_dir / f"{tif_path.stem}.asc"
-		if _validate_existing(dst_path, width, height, cellsize, xllcorner, yllcorner):
+		layer_key = tif_path.stem.lower()
+		is_categorical = layer_key in categorical_lookup
+		if is_categorical:
+			found_categorical.add(layer_key)
+
+		if not is_categorical and _validate_existing(dst_path, width, height, cellsize, xllcorner, yllcorner):
 			LOG.info("Skipping existing environmental layer %s.", dst_path)
 			output_paths_map[index] = dst_path
 			continue
@@ -275,6 +302,7 @@ def stage_enviro(
 				height,
 				dst_transform_gdal,
 				target_crs_wkt,
+				is_categorical,
 			)
 		)
 
@@ -289,5 +317,11 @@ def stage_enviro(
 		else:
 			idx, path = _stage_single_enviro(to_process[0])
 			output_paths_map[idx] = path
+
+	if categorical_lookup:
+		missing = set(categorical_lookup).difference(found_categorical)
+		if missing:
+			names = ", ".join(categorical_lookup[name] for name in sorted(missing))
+			LOG.warning("Categorical layers not found in %s: %s", enviro_dir, names)
 
 	return [output_paths_map[i] for i in range(1, total + 1)]
