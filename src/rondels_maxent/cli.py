@@ -18,8 +18,22 @@ def _build_parser() -> argparse.ArgumentParser:
 	p.add_argument("--enviro", type=str, required=True, help="Environmental data directory")
 	p.add_argument("--output", type=str, required=True, help="Output directory")
 	p.add_argument("--maxent", type=str, required=True, help="maxent.jar directory")
-	p.add_argument("--ul", nargs=2, type=float, required=True, metavar=("UL_LON", "UL_LAT"))
-	p.add_argument("--lr", nargs=2, type=float, required=True, metavar=("LR_LON", "LR_LAT"))
+	p.add_argument(
+		"--ul",
+		nargs=2,
+		type=float,
+		required=True,
+		metavar=("UL_LAT", "UL_LON"),
+		help="Upper-left corner as (lat, lon)",
+	)
+	p.add_argument(
+		"--lr",
+		nargs=2,
+		type=float,
+		required=True,
+		metavar=("LR_LAT", "LR_LON"),
+		help="Lower-right corner as (lat, lon)",
+	)
 	p.add_argument("--min_cell_size", type=int, default=-1, required=False, help="Minimum cell size for background rasters in meters (-1 = automatic)")
 	p.add_argument("--categorical", nargs="+", metavar="LAYER", default=None, help="Layer names (without extension) to treat as categorical")
 	return p
@@ -45,7 +59,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 	enviro_dir = Path(ns.enviro)
 	out_dir = _ensure_dir(Path(ns.output))
 	maxent_dir = Path(ns.maxent)
-	upper_left, lower_right = tuple(ns.ul), tuple(ns.lr)
+	# Accept (lat, lon) from CLI, convert to (lon, lat)
+	upper_left = (ns.ul[1], ns.ul[0])
+	lower_right = (ns.lr[1], ns.lr[0])
 	min_cell_size = None if ns.min_cell_size <= 0 else ns.min_cell_size
 	categorical = [name.strip() for name in ns.categorical] if ns.categorical else None
 
