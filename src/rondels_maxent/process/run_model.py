@@ -143,8 +143,38 @@ def run_model(enviro_layers: List[Path], maxent_dir: Path, out_dir: Path, catego
 	except subprocess.CalledProcessError as exc:
 		raise RuntimeError(f"MaxEnt execution failed with exit code {exc.returncode}") from exc
 
-	# Copy CRS file for spatial context
-	shutil.copy(
-		(base_dir / CRS_FILENAME).resolve(),
-		(base_dir / MAXENT_OUT_DIR / "site.prj").resolve()
-	)
+	# After successful run, normalize outputs
+	# 1) Rename the primary ASCII grid to <base_dir_name>.asc
+	base_name = base_dir.name
+	output_dir = (base_dir / MAXENT_OUT_DIR).resolve()
+	asc_candidates = [output_dir / "side.asc", output_dir / "site.asc"]
+	source_asc = next((p for p in asc_candidates if p.exists()), None)
+	if source_asc is None:
+		LOG.warning(
+			"Expected ASCII output not found. Looked for: %s",
+			", ".join(str(p) for p in asc_candidates),
+		)
+	else:
+		target_asc = output_dir / f"{base_name}{_ASCII_SUFFIX}"
+		if source_asc.resolve() != target_asc.resolve():
+			if target_asc.exists():
+				try:
+					target_asc.unlink()
+				except Exception as exc:  # pragma: no cover - filesystem specifics
+					raise RuntimeError(f"Failed to remove existing target file: {target_asc}") from exc
+			try:
+				source_asc.rename(target_asc)
+			except Exception as exc:  # pragma: no cover - filesystem specifics
+				raise RuntimeError(
+					f"Failed to rename '{source_asc.name}' to '{target_asc.name}'"
+				) from exc
+			LOG.info("Renamed %s to %s", source_asc.name, target_asc.name)
+
+	# 2) Write projection file as both site.prj (legacy) and <base_dir_name>.prj
+	src_prj = (base_dir / CRS_FILENAME).resolve()
+	newname_prj = output_dir / f"{base_name}.prj"
+	try:
+		shutil.copy(src_prj, newname_prj)
+		LOG.info("Saved projection files: %s", newname_prj.name)
+	except Exception as exc:  # pragma: no cover - filesystem specifics
+		raise RuntimeError(f"Failed to write projection files into {output_dir}") from exc
