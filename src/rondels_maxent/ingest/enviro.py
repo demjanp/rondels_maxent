@@ -13,6 +13,7 @@ from affine import Affine
 from rasterio.crs import CRS
 from rasterio.transform import from_origin
 from rasterio.warp import Resampling, calculate_default_transform, reproject
+from rasterio.features import rasterize
 
 from .archeodata import CRS_FILENAME
 
@@ -181,9 +182,20 @@ def _resolve_nodata(value: Optional[float]) -> float:
 
 
 def _stage_single_enviro(
-	task: tuple[int, int, str, str, int, int, tuple[float, ...], str, bool]
+	task: tuple[int, int, str, str, int, int, tuple[float, ...], str, bool, Optional[List[dict]]]
 ) -> tuple[int, Path]:
-	index, total, tif_path_str, dst_path_str, width, height, dst_transform_gdal, target_crs_wkt, is_categorical = task
+	(
+		index,
+		total,
+		tif_path_str,
+		dst_path_str,
+		width,
+		height,
+		dst_transform_gdal,
+		target_crs_wkt,
+		is_categorical,
+		mask_shapes,
+	) = task
 
 	tif_path = Path(tif_path_str)
 	dst_path = Path(dst_path_str)
@@ -214,6 +226,19 @@ def _stage_single_enviro(
 			dst_nodata=dst_nodata,
 		)
 
+	# Apply polygon mask if provided: cells outside polygons -> NoData
+	if mask_shapes:
+		mask = rasterize(
+			mask_shapes,
+			out_shape=(height, width),
+			transform=dst_transform,
+			fill=0,
+			default_value=1,
+			dtype="uint8",
+			all_touched=False,
+		)
+		dst_data[mask == 0] = dst_nodata
+
 	with rasterio.open(
 		dst_path,
 		"w",
@@ -238,6 +263,7 @@ def stage_enviro(
 	lower_right: Tuple[float, float],
 	min_cell_size: Optional[float] = None,
 	categorical_layers: Optional[Iterable[str]] = None,
+	mask_path: Optional[Path] = None,
 ) -> List[Path]:
 	"""Reproject environmental rasters and export them in aligned ASCII grid format.
 
@@ -254,6 +280,9 @@ def stage_enviro(
 	categorical_layers : Iterable[str], optional
 		Names (without extension) of rasters to treat as categorical, resampled with
 		nearest neighbour to preserve class values.
+	mask_path : Path, optional
+		Path to a GPKG containing polygon/multipolygon features to mask the
+		output rasters. Cells outside polygons are written as NoData.
 	"""
 	enviro_dir = Path(enviro_dir)
 	if not enviro_dir.exists():
@@ -274,8 +303,44 @@ def stage_enviro(
 	cellsize = _determine_cellsize(geotiff_paths, target_crs, min_cell_size)
 	width, height, dst_transform, xllcorner, yllcorner = _calculate_grid(upper_left, lower_right, cellsize)
 
+	# Prepare optional polygon mask (in target CRS) for later rasterization
+	mask_shapes: Optional[List[dict]] = None
+	if mask_path is not None:
+		mask_path = Path(mask_path)
+		if not mask_path.exists():
+			raise FileNotFoundError(f"Mask file not found: {mask_path}")
+		# Lazy import to avoid heavy dependency unless needed
+		try:
+			import geopandas as gpd
+			from shapely.geometry import mapping
+		except Exception as exc:  # pragma: no cover - import/runtime environment
+			raise RuntimeError("geopandas and shapely are required to use --mask") from exc
+
+		gdf = gpd.read_file(mask_path)
+		if gdf.empty:
+			raise ValueError(f"No features found in mask dataset: {mask_path}")
+		if gdf.crs is None:
+			raise ValueError(f"Mask dataset has no CRS defined: {mask_path}")
+		gdf = gdf.to_crs(target_crs.to_string())
+		# Keep only valid, non-empty polygonal geometries
+		geoms: List[dict] = []
+		for geom in gdf.geometry:
+			if geom is None or geom.is_empty or not geom.is_valid:
+				continue
+			geom_type = getattr(geom, "geom_type", "")
+			if geom_type in ("Polygon", "MultiPolygon"):
+				if geom_type == "MultiPolygon":
+					for part in geom.geoms:
+						if not part.is_empty:
+							geoms.append(mapping(part))
+				else:
+					geoms.append(mapping(geom))
+		if not geoms:
+			raise ValueError(f"No polygon geometries found in mask dataset: {mask_path}")
+		mask_shapes = geoms
+
 	output_paths_map: dict[int, Path] = {}
-	to_process: List[tuple[int, int, str, str, int, int, tuple[float, ...], str, bool]] = []
+	to_process: List[tuple[int, int, str, str, int, int, tuple[float, ...], str, bool, Optional[List[dict]]]] = []
 	total = len(geotiff_paths)
 	target_crs_wkt = target_crs.to_wkt()
 	dst_transform_gdal = dst_transform.to_gdal()
@@ -287,7 +352,12 @@ def stage_enviro(
 		if is_categorical:
 			found_categorical.add(layer_key)
 
-		if not is_categorical and _validate_existing(dst_path, width, height, cellsize, xllcorner, yllcorner):
+		# Only skip existing outputs when no mask is applied; otherwise regenerate
+		if (
+			not is_categorical
+			and mask_shapes is None
+			and _validate_existing(dst_path, width, height, cellsize, xllcorner, yllcorner)
+		):
 			LOG.info("Skipping existing environmental layer %s.", dst_path)
 			output_paths_map[index] = dst_path
 			continue
@@ -303,6 +373,7 @@ def stage_enviro(
 				dst_transform_gdal,
 				target_crs_wkt,
 				is_categorical,
+				mask_shapes,
 			)
 		)
 

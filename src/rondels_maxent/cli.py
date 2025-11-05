@@ -19,6 +19,15 @@ def _build_parser() -> argparse.ArgumentParser:
 	p.add_argument("--output", type=str, required=True, help="Output directory")
 	p.add_argument("--maxent", type=str, required=True, help="maxent.jar directory")
 	p.add_argument(
+		"--mask",
+		type=str,
+		required=False,
+		help=(
+			"Path to a polygon/multipolygon GPKG to mask background rasters; "
+			"cells outside polygons are written as NoData"
+		),
+	)
+	p.add_argument(
 		"--ul",
 		nargs=2,
 		type=float,
@@ -64,6 +73,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 	lower_right = (ns.lr[1], ns.lr[0])
 	min_cell_size = None if ns.min_cell_size <= 0 else ns.min_cell_size
 	categorical = [name.strip() for name in ns.categorical] if ns.categorical else None
+	mask_path = Path(ns.mask) if getattr(ns, "mask", None) else None
 
 	stage_archeodata(in_path, rules_path, out_dir)
 	enviro_layers = stage_enviro(
@@ -73,6 +83,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 		lower_right,
 		min_cell_size,
 		categorical_layers=categorical,
+		mask_path=mask_path,
 	)
 	run_model(enviro_layers, maxent_dir, out_dir, categorical)
 	
