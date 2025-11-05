@@ -322,19 +322,46 @@ def stage_enviro(
 		if gdf.crs is None:
 			raise ValueError(f"Mask dataset has no CRS defined: {mask_path}")
 		gdf = gdf.to_crs(target_crs.to_string())
-		# Keep only valid, non-empty polygonal geometries
+		# Collect polygonal geometries; attempt to fix invalid ones and extract
+		# polygons from collections when necessary.
 		geoms: List[dict] = []
+		try:
+			# explode to handle multiparts uniformly (GeoPandas >= 0.8)
+			gdf = gdf.explode(index_parts=False)
+		except Exception:
+			pass
+		try:
+			from shapely.validation import make_valid as _make_valid
+		except Exception:
+			_make_valid = None  # type: ignore
+
 		for geom in gdf.geometry:
-			if geom is None or geom.is_empty or not geom.is_valid:
+			if geom is None or geom.is_empty:
 				continue
-			geom_type = getattr(geom, "geom_type", "")
-			if geom_type in ("Polygon", "MultiPolygon"):
-				if geom_type == "MultiPolygon":
-					for part in geom.geoms:
-						if not part.is_empty:
-							geoms.append(mapping(part))
-				else:
-					geoms.append(mapping(geom))
+			if not geom.is_valid:
+				try:
+					geom = _make_valid(geom) if _make_valid else geom.buffer(0)
+				except Exception:
+					# If repair fails, keep original; rasterize may still handle it
+					pass
+			if geom is None or geom.is_empty:
+				continue
+			gt = getattr(geom, "geom_type", "")
+			if gt == "Polygon":
+				geoms.append(mapping(geom))
+			elif gt == "MultiPolygon":
+				for part in getattr(geom, "geoms", []):
+					if part and not part.is_empty:
+						geoms.append(mapping(part))
+			elif gt == "GeometryCollection":
+				for part in getattr(geom, "geoms", []):
+					pt = getattr(part, "geom_type", "")
+					if pt == "Polygon":
+						geoms.append(mapping(part))
+					elif pt == "MultiPolygon":
+						for p2 in getattr(part, "geoms", []):
+							if p2 and not p2.is_empty:
+								geoms.append(mapping(p2))
 		if not geoms:
 			raise ValueError(f"No polygon geometries found in mask dataset: {mask_path}")
 		mask_shapes = geoms
