@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Iterable, List, Optional, Tuple
 from pathlib import Path
+from dataclasses import dataclass
 import logging
 import math
 
@@ -20,9 +21,16 @@ from .archeodata import CRS_FILENAME
 LOG = logging.getLogger(__name__)
 
 ENVIRO_DIR = "data/enviro"
+PROJECTION_DIR = "data/projection"
 _TIF_EXTENSIONS = {".tif", ".tiff"}
 _DEFAULT_NODATA = -9999.0
 _TRANSFORM_TOL = 1e-6
+
+
+@dataclass(frozen=True)
+class StageEnviroResult:
+	environment_layers: List[Path]
+	projection_layers: Optional[List[Path]] = None
 
 
 def _load_target_crs(out_dir: Path) -> CRS:
@@ -181,6 +189,77 @@ def _resolve_nodata(value: Optional[float]) -> float:
 	return numeric
 
 
+def _prepare_mask(mask_path: Path, target_crs: CRS) -> tuple[List[dict], Tuple[float, float, float, float]]:
+	mask_path = Path(mask_path)
+	if not mask_path.exists():
+		raise FileNotFoundError(f"Mask file not found: {mask_path}")
+
+	try:
+		import geopandas as gpd
+		from shapely.geometry import mapping
+	except Exception as exc:  # pragma: no cover - import/runtime environment
+		raise RuntimeError("geopandas and shapely are required to use --mask") from exc
+
+	gdf = gpd.read_file(mask_path)
+	if gdf.empty:
+		raise ValueError(f"No features found in mask dataset: {mask_path}")
+	if gdf.crs is None:
+		raise ValueError(f"Mask dataset has no CRS defined: {mask_path}")
+
+	gdf = gdf.to_crs(target_crs.to_string())
+	bounds_raw = tuple(float(v) for v in gdf.total_bounds)
+	if len(bounds_raw) != 4:
+		raise ValueError(f"Failed to compute bounds for mask dataset: {mask_path}")
+	minx, miny, maxx, maxy = bounds_raw
+	if not all(math.isfinite(v) for v in bounds_raw):
+		raise ValueError(f"Mask dataset bounds contain non-finite values: {bounds_raw}")
+	if minx >= maxx or miny >= maxy:
+		raise ValueError(f"Mask dataset has invalid bounds after reprojection: {bounds_raw}")
+
+	try:
+		gdf = gdf.explode(index_parts=False)
+	except Exception:
+		pass
+
+	try:
+		from shapely.validation import make_valid as _make_valid
+	except Exception:  # pragma: no cover - optional dependency
+		_make_valid = None  # type: ignore
+
+	geoms: List[dict] = []
+	for geom in gdf.geometry:
+		if geom is None or geom.is_empty:
+			continue
+		if not geom.is_valid:
+			try:
+				geom = _make_valid(geom) if _make_valid else geom.buffer(0)
+			except Exception:
+				pass
+		if geom is None or geom.is_empty:
+			continue
+		geom_type = getattr(geom, "geom_type", "")
+		if geom_type == "Polygon":
+			geoms.append(mapping(geom))
+		elif geom_type == "MultiPolygon":
+			for part in getattr(geom, "geoms", []):
+				if part and not part.is_empty:
+					geoms.append(mapping(part))
+		elif geom_type == "GeometryCollection":
+			for part in getattr(geom, "geoms", []):
+				sub_type = getattr(part, "geom_type", "")
+				if sub_type == "Polygon":
+					geoms.append(mapping(part))
+				elif sub_type == "MultiPolygon":
+					for sub_part in getattr(part, "geoms", []):
+						if sub_part and not sub_part.is_empty:
+							geoms.append(mapping(sub_part))
+
+	if not geoms:
+		raise ValueError(f"No polygon geometries found in mask dataset: {mask_path}")
+
+	return geoms, (minx, miny, maxx, maxy)
+
+
 def _stage_single_enviro(
 	task: tuple[int, int, str, str, int, int, tuple[float, ...], str, bool, Optional[List[dict]]]
 ) -> tuple[int, Path]:
@@ -256,115 +335,24 @@ def _stage_single_enviro(
 	return index, dst_path
 
 
-def stage_enviro(
-	enviro_dir: Path,
-	out_dir: Path,
-	upper_left: Tuple[float, float],
-	lower_right: Tuple[float, float],
-	min_cell_size: Optional[float] = None,
-	categorical_layers: Optional[Iterable[str]] = None,
-	mask_path: Optional[Path] = None,
+def _stage_raster_set(
+	geotiff_paths: List[Path],
+	dst_dir: Path,
+	width: int,
+	height: int,
+	dst_transform: Affine,
+	target_crs: CRS,
+	cellsize: float,
+	xllcorner: float,
+	yllcorner: float,
+	categorical_lookup: dict[str, str],
+	found_categorical: set[str],
+	mask_shapes: Optional[List[dict]],
+	allow_skip_existing: bool,
+	dataset_label: str,
 ) -> List[Path]:
-	"""Reproject environmental rasters and export them in aligned ASCII grid format.
-
-	Parameters
-	----------
-	enviro_dir : Path
-		Directory containing source GeoTIFFs.
-	out_dir : Path
-		Workspace directory that will receive the ASCII outputs.
-	upper_left, lower_right : tuple[float, float]
-		AOI bounds (in target CRS coordinates).
-	min_cell_size : float, optional
-		Minimum cell size in meters; auto-calculated when omitted or <= 0.
-	categorical_layers : Iterable[str], optional
-		Names (without extension) of rasters to treat as categorical, resampled with
-		nearest neighbour to preserve class values.
-	mask_path : Path, optional
-		Path to a GPKG containing polygon/multipolygon features to mask the
-		output rasters. Cells outside polygons are written as NoData.
-	"""
-	enviro_dir = Path(enviro_dir)
-	if not enviro_dir.exists():
-		raise FileNotFoundError(f"Enviro directory not found: {enviro_dir}")
-	if not enviro_dir.is_dir():
-		raise NotADirectoryError(f"Enviro path is not a directory: {enviro_dir}")
-
-	out_dir = Path(out_dir)
-	asc_dir = out_dir / ENVIRO_DIR
-	asc_dir.mkdir(parents=True, exist_ok=True)
-
-	target_crs = _load_target_crs(out_dir)
-	geotiff_paths = _collect_geotiffs(enviro_dir)
-	categorical_lookup = {
-		name.lower(): name for name in categorical_layers or []
-	}
-	found_categorical: set[str] = set()
-	cellsize = _determine_cellsize(geotiff_paths, target_crs, min_cell_size)
-	width, height, dst_transform, xllcorner, yllcorner = _calculate_grid(upper_left, lower_right, cellsize)
-
-	# Prepare optional polygon mask (in target CRS) for later rasterization
-	mask_shapes: Optional[List[dict]] = None
-	if mask_path is not None:
-		mask_path = Path(mask_path)
-		if not mask_path.exists():
-			raise FileNotFoundError(f"Mask file not found: {mask_path}")
-		# Lazy import to avoid heavy dependency unless needed
-		try:
-			import geopandas as gpd
-			from shapely.geometry import mapping
-		except Exception as exc:  # pragma: no cover - import/runtime environment
-			raise RuntimeError("geopandas and shapely are required to use --mask") from exc
-
-		gdf = gpd.read_file(mask_path)
-		if gdf.empty:
-			raise ValueError(f"No features found in mask dataset: {mask_path}")
-		if gdf.crs is None:
-			raise ValueError(f"Mask dataset has no CRS defined: {mask_path}")
-		gdf = gdf.to_crs(target_crs.to_string())
-		# Collect polygonal geometries; attempt to fix invalid ones and extract
-		# polygons from collections when necessary.
-		geoms: List[dict] = []
-		try:
-			# explode to handle multiparts uniformly (GeoPandas >= 0.8)
-			gdf = gdf.explode(index_parts=False)
-		except Exception:
-			pass
-		try:
-			from shapely.validation import make_valid as _make_valid
-		except Exception:
-			_make_valid = None  # type: ignore
-
-		for geom in gdf.geometry:
-			if geom is None or geom.is_empty:
-				continue
-			if not geom.is_valid:
-				try:
-					geom = _make_valid(geom) if _make_valid else geom.buffer(0)
-				except Exception:
-					# If repair fails, keep original; rasterize may still handle it
-					pass
-			if geom is None or geom.is_empty:
-				continue
-			gt = getattr(geom, "geom_type", "")
-			if gt == "Polygon":
-				geoms.append(mapping(geom))
-			elif gt == "MultiPolygon":
-				for part in getattr(geom, "geoms", []):
-					if part and not part.is_empty:
-						geoms.append(mapping(part))
-			elif gt == "GeometryCollection":
-				for part in getattr(geom, "geoms", []):
-					pt = getattr(part, "geom_type", "")
-					if pt == "Polygon":
-						geoms.append(mapping(part))
-					elif pt == "MultiPolygon":
-						for p2 in getattr(part, "geoms", []):
-							if p2 and not p2.is_empty:
-								geoms.append(mapping(p2))
-		if not geoms:
-			raise ValueError(f"No polygon geometries found in mask dataset: {mask_path}")
-		mask_shapes = geoms
+	dst_dir = Path(dst_dir)
+	dst_dir.mkdir(parents=True, exist_ok=True)
 
 	output_paths_map: dict[int, Path] = {}
 	to_process: List[tuple[int, int, str, str, int, int, tuple[float, ...], str, bool, Optional[List[dict]]]] = []
@@ -373,19 +361,19 @@ def stage_enviro(
 	dst_transform_gdal = dst_transform.to_gdal()
 
 	for index, tif_path in enumerate(geotiff_paths, start=1):
-		dst_path = asc_dir / f"{tif_path.stem}.asc"
+		dst_path = dst_dir / f"{tif_path.stem}.asc"
 		layer_key = tif_path.stem.lower()
 		is_categorical = layer_key in categorical_lookup
 		if is_categorical:
 			found_categorical.add(layer_key)
 
-		# Only skip existing outputs when no mask is applied; otherwise regenerate
 		if (
-			not is_categorical
+			allow_skip_existing
+			and not is_categorical
 			and mask_shapes is None
 			and _validate_existing(dst_path, width, height, cellsize, xllcorner, yllcorner)
 		):
-			LOG.info("Skipping existing environmental layer %s.", dst_path)
+			LOG.info("Skipping existing %s layer %s.", dataset_label, dst_path)
 			output_paths_map[index] = dst_path
 			continue
 
@@ -416,10 +404,131 @@ def stage_enviro(
 			idx, path = _stage_single_enviro(to_process[0])
 			output_paths_map[idx] = path
 
+	return [output_paths_map[i] for i in range(1, total + 1)]
+
+
+def stage_enviro(
+	enviro_dir: Path,
+	out_dir: Path,
+	upper_left: Tuple[float, float],
+	lower_right: Tuple[float, float],
+	min_cell_size: Optional[float] = None,
+	categorical_layers: Optional[Iterable[str]] = None,
+	mask_path: Optional[Path] = None,
+) -> StageEnviroResult:
+	"""Reproject environmental rasters and export them in aligned ASCII grid format.
+
+	Parameters
+	----------
+	enviro_dir : Path
+		Directory containing source GeoTIFFs.
+	out_dir : Path
+		Workspace directory that will receive the ASCII outputs.
+	upper_left, lower_right : tuple[float, float]
+		AOI bounds (in target CRS coordinates).
+	min_cell_size : float, optional
+		Minimum cell size in meters; auto-calculated when omitted or <= 0.
+	categorical_layers : Iterable[str], optional
+		Names (without extension) of rasters to treat as categorical, resampled with
+		nearest neighbour to preserve class values.
+	mask_path : Path, optional
+		Path to a GPKG containing polygon/multipolygon features to mask the
+		output rasters. Cells outside polygons are written as NoData.
+
+	Returns
+	-------
+	StageEnviroResult
+		Paths to staged environmental layers and optional projection layers.
+	"""
+	enviro_dir = Path(enviro_dir)
+	if not enviro_dir.exists():
+		raise FileNotFoundError(f"Enviro directory not found: {enviro_dir}")
+	if not enviro_dir.is_dir():
+		raise NotADirectoryError(f"Enviro path is not a directory: {enviro_dir}")
+
+	out_dir = Path(out_dir)
+	asc_dir = out_dir / ENVIRO_DIR
+	asc_dir.mkdir(parents=True, exist_ok=True)
+
+	target_crs = _load_target_crs(out_dir)
+	geotiff_paths = _collect_geotiffs(enviro_dir)
+	categorical_lookup = {
+		name.lower(): name for name in categorical_layers or []
+	}
+	found_categorical: set[str] = set()
+
+	cellsize = _determine_cellsize(geotiff_paths, target_crs, min_cell_size)
+
+	mask_shapes: Optional[List[dict]] = None
+	env_upper_left = (float(upper_left[0]), float(upper_left[1]))
+	env_lower_right = (float(lower_right[0]), float(lower_right[1]))
+
+	if mask_path is not None:
+		mask_shapes, mask_bounds = _prepare_mask(mask_path, target_crs)
+		minx, miny, maxx, maxy = mask_bounds
+		env_upper_left = (minx, maxy)
+		env_lower_right = (maxx, miny)
+		LOG.info(
+			"Using mask bounds for environmental layers: UL=(%.6f, %.6f), LR=(%.6f, %.6f)",
+			env_upper_left[0],
+			env_upper_left[1],
+			env_lower_right[0],
+			env_lower_right[1],
+		)
+
+	env_width, env_height, env_transform, env_xllcorner, env_yllcorner = _calculate_grid(
+		env_upper_left, env_lower_right, cellsize
+	)
+
+	environment_layers = _stage_raster_set(
+		geotiff_paths,
+		asc_dir,
+		env_width,
+		env_height,
+		env_transform,
+		target_crs,
+		cellsize,
+		env_xllcorner,
+		env_yllcorner,
+		categorical_lookup,
+		found_categorical,
+		mask_shapes,
+		allow_skip_existing=mask_shapes is None,
+		dataset_label="environmental",
+	)
+
+	projection_layers: Optional[List[Path]] = None
+	if mask_shapes is not None:
+		projection_dir = out_dir / PROJECTION_DIR
+		proj_width, proj_height, proj_transform, proj_xllcorner, proj_yllcorner = _calculate_grid(
+			(float(upper_left[0]), float(upper_left[1])),
+			(float(lower_right[0]), float(lower_right[1])),
+			cellsize,
+		)
+		projection_layers = _stage_raster_set(
+			geotiff_paths,
+			projection_dir,
+			proj_width,
+			proj_height,
+			proj_transform,
+			target_crs,
+			cellsize,
+			proj_xllcorner,
+			proj_yllcorner,
+			categorical_lookup,
+			found_categorical,
+			mask_shapes=None,
+			allow_skip_existing=False,
+			dataset_label="projection",
+		)
+
 	if categorical_lookup:
 		missing = set(categorical_lookup).difference(found_categorical)
 		if missing:
 			names = ", ".join(categorical_lookup[name] for name in sorted(missing))
 			LOG.warning("Categorical layers not found in %s: %s", enviro_dir, names)
 
-	return [output_paths_map[i] for i in range(1, total + 1)]
+	return StageEnviroResult(
+		environment_layers=environment_layers,
+		projection_layers=projection_layers,
+	)

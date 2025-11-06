@@ -88,7 +88,13 @@ def _prepare_maxent_paths(maxent_dir: Path) -> Path:
 	return jar_path
 
 
-def run_model(enviro_layers: List[Path], maxent_dir: Path, out_dir: Path, categorical: Optional[List[str]] = None):
+def run_model(
+	enviro_layers: List[Path],
+	maxent_dir: Path,
+	out_dir: Path,
+	categorical: Optional[List[str]] = None,
+	projection_layers: Optional[List[Path]] = None,
+) -> None:
 	"""Execute MaxEnt model using prepared samples and environmental layers.
 
 	Parameters
@@ -102,9 +108,16 @@ def run_model(enviro_layers: List[Path], maxent_dir: Path, out_dir: Path, catego
 	categorical : list[str], optional
 		Names (without extension) of layers to treat as categorical.
 		Example: ['HWSD2', 'landcover']
+	projection_layers : list[Path], optional
+		Paths to projection rasters that will be supplied to MaxEnt via the
+		`projectionlayers` parameter when provided.
 	"""
 	resolved_layers = _validate_env_layers(enviro_layers)
 	layer_dir = _ensure_single_parent(resolved_layers)
+	projection_dir: Optional[Path] = None
+	if projection_layers:
+		resolved_projection_layers = _validate_env_layers(projection_layers)
+		projection_dir = _ensure_single_parent(resolved_projection_layers).resolve()
 	base_dir = Path(out_dir)
 	samples_path = _validate_samples_file(base_dir)
 	maxent_jar = _prepare_maxent_paths(maxent_dir)
@@ -130,6 +143,10 @@ def run_model(enviro_layers: List[Path], maxent_dir: Path, out_dir: Path, catego
 		"autorun",
 	]
 
+	if projection_dir:
+		LOG.info("Supplying projection layers from %s", projection_dir)
+		command.append(f"projectionlayers={str(projection_dir)}")
+
 	# Add categorical layers
 	if categorical:
 		unique_names = list(dict.fromkeys(categorical))  # preserve order, remove duplicates
@@ -147,7 +164,7 @@ def run_model(enviro_layers: List[Path], maxent_dir: Path, out_dir: Path, catego
 	# 1) Rename the primary ASCII grid to <base_dir_name>.asc
 	base_name = base_dir.name
 	output_dir = (base_dir / MAXENT_OUT_DIR).resolve()
-	asc_candidates = [output_dir / "side.asc", output_dir / "site.asc"]
+	asc_candidates = [output_dir / "site_projection.asc", output_dir / "site.asc"]
 	source_asc = next((p for p in asc_candidates if p.exists()), None)
 	if source_asc is None:
 		LOG.warning(

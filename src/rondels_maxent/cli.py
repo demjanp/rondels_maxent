@@ -76,7 +76,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 	mask_path = Path(ns.mask) if getattr(ns, "mask", None) else None
 
 	stage_archeodata(in_path, rules_path, out_dir)
-	enviro_layers = stage_enviro(
+	enviro_result = stage_enviro(
 		enviro_dir,
 		out_dir,
 		upper_left,
@@ -85,7 +85,13 @@ def main(argv: Optional[list[str]] = None) -> int:
 		categorical_layers=categorical,
 		mask_path=mask_path,
 	)
-	run_model(enviro_layers, maxent_dir, out_dir, categorical)
+	run_model(
+		enviro_result.environment_layers,
+		maxent_dir,
+		out_dir,
+		categorical,
+		projection_layers=enviro_result.projection_layers,
+	)
 	
 	return 0
 
