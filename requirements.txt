@@ -5,3 +5,4 @@ numpy
 affine
 tqdm
 openpyxl
+matplotlib
