@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -29,6 +31,23 @@ class AsciiGrid:
     cellsize: float
 
 
+@dataclass
+class StatisticSummary:
+    mean: float
+    ci_low: float
+    ci_high: float
+
+
+@dataclass
+class OverlapResult:
+    variable: str
+    schoeners_d: StatisticSummary
+    avg_niche1: StatisticSummary
+    avg_niche2: StatisticSummary
+    avg_diff: StatisticSummary
+    avg_diff_z: StatisticSummary
+
+
 BBox = Tuple[float, float, float, float]
 FLOAT_TOL = 1e-6
 NUM_BINS = 100
@@ -45,13 +64,19 @@ def parse_args() -> argparse.Namespace:
         "--niche1",
         required=True,
         type=Path,
-        help="Path to the first niche in ESRI .asc format (values 0..1).",
+        help=(
+            "Directory containing a 'maxent' subfolder with site_#.asc rasters for "
+            "the first niche (legacy: direct path to one .asc)."
+        ),
     )
     parser.add_argument(
         "--niche2",
         required=True,
         type=Path,
-        help="Path to the second niche in ESRI .asc format (values 0..1).",
+        help=(
+            "Directory containing a 'maxent' subfolder with site_#.asc rasters for "
+            "the second niche (legacy: direct path to one .asc)."
+        ),
     )
     parser.add_argument(
         "--enviro",
@@ -85,6 +110,43 @@ def parse_categorical_layers(values: Sequence[str]) -> Set[str]:
             if name:
                 result.add(name)
     return result
+
+
+def load_niche_ensemble(niche_path: Path) -> List[AsciiGrid]:
+    asc_paths = _collect_niche_files(niche_path)
+    return [read_ascii_grid(path) for path in asc_paths]
+
+
+def _collect_niche_files(niche_path: Path) -> List[Path]:
+    if niche_path.is_file():
+        if niche_path.suffix.lower() != ".asc":
+            raise SystemExit(f"Niche path must be an .asc file or directory: {niche_path}")
+        return [niche_path]
+
+    if not niche_path.exists():
+        raise SystemExit(f"Niche path does not exist: {niche_path}")
+    if not niche_path.is_dir():
+        raise SystemExit(f"Niche path must be a directory: {niche_path}")
+
+    candidate_dir = niche_path / "maxent"
+    if candidate_dir.is_dir():
+        search_dir = candidate_dir
+    else:
+        search_dir = niche_path
+    asc_paths = sorted(
+        (p for p in search_dir.iterdir() if p.suffix.lower() == ".asc"),
+        key=_site_sort_key,
+    )
+    if not asc_paths:
+        raise SystemExit(f"No .asc files found in {search_dir}")
+    return asc_paths
+
+
+def _site_sort_key(path: Path) -> Tuple[int, str]:
+    match = re.search(r"(\d+)$", path.stem)
+    if match:
+        return int(match.group(1)), path.name.lower()
+    return sys.maxsize, path.name.lower()
 
 
 def read_ascii_grid(path: Path) -> AsciiGrid:
@@ -244,6 +306,72 @@ def align_niches(niche1: AsciiGrid, niche2: AsciiGrid) -> Tuple[AsciiGrid, Ascii
     return clipped1, clipped2, bbox
 
 
+def align_niche_ensembles(
+    niche1_members: Sequence[AsciiGrid],
+    niche2_members: Sequence[AsciiGrid],
+) -> Tuple[List[AsciiGrid], List[AsciiGrid], BBox]:
+    if not niche1_members or not niche2_members:
+        raise SystemExit("Both niches must contain at least one raster.")
+    if len(niche1_members) != len(niche2_members):
+        raise SystemExit("Niche ensembles must have the same number of rasters.")
+
+    all_members = list(niche1_members) + list(niche2_members)
+    cellsize = all_members[0].cellsize
+    for member in all_members[1:]:
+        if not np.isclose(member.cellsize, cellsize, rtol=0, atol=cellsize * FLOAT_TOL):
+            raise SystemExit("All niche rasters must share the same cellsize.")
+
+    bbox = _intersection_bbox(all_members)
+    if bbox is None:
+        raise SystemExit("Niche rasters do not overlap spatially.")
+
+    aligned1 = []
+    aligned2 = []
+    for member in niche1_members:
+        clipped = clip_grid_to_bbox(member, bbox)
+        if clipped is None:
+            raise SystemExit("Failed to align niche 1 rasters to the common overlap.")
+        aligned1.append(clipped)
+    for member in niche2_members:
+        clipped = clip_grid_to_bbox(member, bbox)
+        if clipped is None:
+            raise SystemExit("Failed to align niche 2 rasters to the common overlap.")
+        aligned2.append(clipped)
+    return aligned1, aligned2, bbox
+
+
+def _intersection_bbox(grids: Sequence[AsciiGrid]) -> Optional[BBox]:
+    if not grids:
+        return None
+    x_min, x_max, y_min, y_max = grid_bbox(grids[0])
+    for grid in grids[1:]:
+        gx_min, gx_max, gy_min, gy_max = grid_bbox(grid)
+        x_min = max(x_min, gx_min)
+        x_max = min(x_max, gx_max)
+        y_min = max(y_min, gy_min)
+        y_max = min(y_max, gy_max)
+        if x_min >= x_max or y_min >= y_max:
+            return None
+    return x_min, x_max, y_min, y_max
+
+
+def average_ascii_grids(grids: Sequence[AsciiGrid]) -> AsciiGrid:
+    if not grids:
+        raise ValueError("Cannot average an empty list of grids.")
+    data_stack = np.stack([grid.data for grid in grids], axis=0)
+    mean_data = np.nanmean(data_stack, axis=0)
+    template = grids[0]
+    return AsciiGrid(
+        data=mean_data,
+        nodata=template.nodata,
+        ncols=template.ncols,
+        nrows=template.nrows,
+        xllcorner=template.xllcorner,
+        yllcorner=template.yllcorner,
+        cellsize=template.cellsize,
+    )
+
+
 def combined_valid_values(env: np.ndarray, niche1: np.ndarray, niche2: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     if env.shape != niche1.shape or env.shape != niche2.shape:
         raise ValueError("Raster shapes do not match.")
@@ -308,6 +436,44 @@ def schoeners_d(dist1: np.ndarray, dist2: np.ndarray) -> float:
     return 1.0 - 0.5 * np.abs(dist1 - dist2).sum()
 
 
+def build_distributions(
+    env_values: np.ndarray,
+    weights1: np.ndarray,
+    weights2: np.ndarray,
+    is_categorical: bool,
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+    if is_categorical:
+        categories, counts1, counts2 = compute_categorical_histograms(env_values, weights1, weights2)
+        dist1 = normalize_counts(counts1)
+        dist2 = normalize_counts(counts2)
+        return dist1, dist2, categories, None
+    counts1, counts2, bin_edges = compute_histograms(env_values, weights1, weights2, NUM_BINS)
+    dist1 = normalize_counts(counts1)
+    dist2 = normalize_counts(counts2)
+    return dist1, dist2, None, bin_edges
+
+
+def compute_overlap_stats(
+    env_values: np.ndarray,
+    weights1: np.ndarray,
+    weights2: np.ndarray,
+    is_categorical: bool,
+) -> Tuple[float, float, float, float, float]:
+    if env_values.size == 0:
+        return (float("nan"),) * 5
+    dist1, dist2, _, _ = build_distributions(env_values, weights1, weights2, is_categorical)
+    d_value = schoeners_d(dist1, dist2)
+    avg1 = weighted_average(env_values, weights1)
+    avg2 = weighted_average(env_values, weights2)
+    avg_diff = avg1 - avg2 if np.isfinite(avg1) and np.isfinite(avg2) else float("nan")
+    std_env = float(np.nanstd(env_values, ddof=0))
+    if not np.isfinite(std_env) or std_env == 0.0 or not np.isfinite(avg_diff):
+        avg_diff_z = float("nan")
+    else:
+        avg_diff_z = avg_diff / std_env
+    return d_value, avg1, avg2, avg_diff, avg_diff_z
+
+
 def plot_overlap(
     bin_edges: np.ndarray,
     dist1: np.ndarray,
@@ -315,10 +481,10 @@ def plot_overlap(
     label1: str,
     label2: str,
     variable_name: str,
-    d_value: float,
     output_path: Path,
-    avg1: float,
-    avg2: float,
+    avg1_summary: StatisticSummary,
+    avg2_summary: StatisticSummary,
+    d_summary: StatisticSummary,
 ) -> None:
     title = f"{variable_name} overlap"
     centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
@@ -339,17 +505,19 @@ def plot_overlap(
         color=line2.get_color(),
         alpha=0.3,
     )
-    if np.isfinite(avg1):
+    _draw_ci_band(ax, avg1_summary, line1.get_color())
+    _draw_ci_band(ax, avg2_summary, line2.get_color())
+    if np.isfinite(avg1_summary.mean):
         ax.axvline(
-            avg1,
+            avg1_summary.mean,
             color=line1.get_color(),
             linestyle="--",
             linewidth=1.5,
             label=f"{label1} avg",
         )
-    if np.isfinite(avg2):
+    if np.isfinite(avg2_summary.mean):
         ax.axvline(
-            avg2,
+            avg2_summary.mean,
             color=line2.get_color(),
             linestyle="--",
             linewidth=1.5,
@@ -363,10 +531,11 @@ def plot_overlap(
     ax.text(
         0.98,
         0.95,
-        f"Schoener's D = {d_value:.3f}",
+        _format_d_text(d_summary),
         transform=ax.transAxes,
         ha="right",
         va="top",
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
     )
     ax.grid(True, linestyle="--", alpha=0.3)
 
@@ -383,12 +552,13 @@ def plot_categorical_overlap(
     label1: str,
     label2: str,
     variable_name: str,
-    d_value: float,
     output_path: Path,
-    avg1: float,
-    avg2: float,
+    avg1_summary: StatisticSummary,
+    avg2_summary: StatisticSummary,
+    d_summary: StatisticSummary,
+    category_labels: Optional[Dict[float, str]] = None,
 ) -> None:
-    fig, ax = plt.subplots(figsize=(6, 3))
+    fig, ax = plt.subplots(figsize=(6, 4))
     width = 0.7
     bars1 = ax.bar(
         categories - width / 2,
@@ -411,20 +581,28 @@ def plot_categorical_overlap(
     ax.set_ylabel("Probability")
     ax.set_title(f"{variable_name} overlap (categorical)")
     ax.set_xticks(categories)
-    ax.set_xticklabels([_format_category_label(value) for value in categories])
+    if category_labels:
+        tick_labels = [
+            category_labels.get(float(value), _format_category_label(value)) for value in categories
+        ]
+    else:
+        tick_labels = [_format_category_label(value) for value in categories]
+    ax.set_xticklabels(tick_labels, rotation=90)
     color1 = bars1.patches[0].get_facecolor() if bars1.patches else (0, 0, 0, 1)
     color2 = bars2.patches[0].get_facecolor() if bars2.patches else (0.5, 0.5, 0.5, 1)
-    if np.isfinite(avg1):
+    _draw_ci_band(ax, avg1_summary, color1)
+    _draw_ci_band(ax, avg2_summary, color2)
+    if np.isfinite(avg1_summary.mean):
         ax.axvline(
-            avg1,
+            avg1_summary.mean,
             color=color1,
             linestyle="--",
             linewidth=1.5,
             label=f"{label1} avg",
         )
-    if np.isfinite(avg2):
+    if np.isfinite(avg2_summary.mean):
         ax.axvline(
-            avg2,
+            avg2_summary.mean,
             color=color2,
             linestyle="--",
             linewidth=1.5,
@@ -434,7 +612,7 @@ def plot_categorical_overlap(
     ax.text(
         0.98,
         0.95,
-        f"Schoener's D = {d_value:.3f}",
+        _format_d_text(d_summary),
         transform=ax.transAxes,
         ha="right",
         va="top",
@@ -448,18 +626,58 @@ def plot_categorical_overlap(
     plt.close(fig)
 
 
+def _draw_ci_band(ax, summary: StatisticSummary, color: Tuple[float, ...]) -> None:
+    if summary is None:
+        return
+    lower = summary.ci_low
+    upper = summary.ci_high
+    if np.isfinite(lower) and np.isfinite(upper) and upper > lower:
+        ax.axvspan(lower, upper, color=color, alpha=0.15)
+
+
+def _format_d_text(summary: StatisticSummary) -> str:
+    if not np.isfinite(summary.mean):
+        return "Schoener's D = N/A"
+    return f"Schoener's D = {summary.mean:.3f}"
+
+
+def summarize_statistics(
+    values: Sequence[float],
+    lower_percentile: float = 2.5,
+    upper_percentile: float = 97.5,
+) -> StatisticSummary:
+    finite_values = [float(value) for value in values if np.isfinite(value)]
+    if not finite_values:
+        nan_value = float("nan")
+        return StatisticSummary(nan_value, nan_value, nan_value)
+    array = np.asarray(finite_values, dtype=float)
+    mean = float(np.mean(array))
+    if array.size == 1:
+        return StatisticSummary(mean, mean, mean)
+    ci_low = float(np.percentile(array, lower_percentile))
+    ci_high = float(np.percentile(array, upper_percentile))
+    return StatisticSummary(mean, ci_low, ci_high)
+
+
 def process_layers(
     env_layers: Sequence[Path],
-    niche1: AsciiGrid,
-    niche2: AsciiGrid,
+    niche1_members: Sequence[AsciiGrid],
+    niche2_members: Sequence[AsciiGrid],
+    mean_niche1: AsciiGrid,
+    mean_niche2: AsciiGrid,
     output_dir: Path,
     bbox: BBox,
     niche1_name: str,
     niche2_name: str,
     categorical_layers: Set[str],
-) -> List[Tuple[str, float, float, float, float, float]]:
+    ci_percentiles: Tuple[float, float] = (2.5, 97.5),
+) -> List[OverlapResult]:
     generated = 0
-    overlaps: List[Tuple[str, float, float, float, float, float]] = []
+    overlaps: List[OverlapResult] = []
+    lower_pct, upper_pct = ci_percentiles
+    niche1_stack = np.stack([member.data for member in niche1_members], axis=0)
+    niche2_stack = np.stack([member.data for member in niche2_members], axis=0)
+
     for env_path in env_layers:
         try:
             env_grid = read_ascii_grid(env_path)
@@ -475,40 +693,62 @@ def process_layers(
             )
             continue
 
-        env_values, weights1, weights2 = combined_valid_values(
-            clipped_env.data, niche1.data, niche2.data
+        plot_env_values, plot_weights1, plot_weights2 = combined_valid_values(
+            clipped_env.data, mean_niche1.data, mean_niche2.data
         )
-        if env_values.size == 0:
+        if plot_env_values.size == 0:
             print(f"[warn] No overlapping valid cells in {env_path}", file=sys.stderr)
             continue
 
         layer_name = env_path.stem
         is_categorical = layer_name.lower() in categorical_layers
-        if is_categorical:
-            categories, counts1, counts2 = compute_categorical_histograms(
-                env_values, weights1, weights2
+        category_labels = load_category_labels(env_path) if is_categorical else None
+        dist1, dist2, categories, bin_edges = build_distributions(
+            plot_env_values, plot_weights1, plot_weights2, is_categorical
+        )
+
+        d_samples: List[float] = []
+        avg1_samples: List[float] = []
+        avg2_samples: List[float] = []
+        avg_diff_samples: List[float] = []
+        avg_diff_z_samples: List[float] = []
+
+        for idx in range(niche1_stack.shape[0]):
+            env_values, weights1, weights2 = combined_valid_values(
+                clipped_env.data, niche1_stack[idx], niche2_stack[idx]
             )
-            dist1 = normalize_counts(counts1)
-            dist2 = normalize_counts(counts2)
-            bin_edges = None
-        else:
-            counts1, counts2, bin_edges = compute_histograms(
-                env_values, weights1, weights2, NUM_BINS
+            if env_values.size == 0:
+                continue
+            d_value, avg1, avg2, avg_diff, avg_diff_z = compute_overlap_stats(
+                env_values, weights1, weights2, is_categorical
             )
-            dist1 = normalize_counts(counts1)
-            dist2 = normalize_counts(counts2)
-        d_value = schoeners_d(dist1, dist2)
-        avg1 = weighted_average(env_values, weights1)
-        avg2 = weighted_average(env_values, weights2)
-        avg_diff = avg1 - avg2 if np.isfinite(avg1) and np.isfinite(avg2) else float("nan")
-        std_env = float(np.nanstd(env_values, ddof=0))
-        if not np.isfinite(std_env) or std_env == 0.0:
-            avg_diff_z = float("nan")
-        else:
-            avg_diff_z = avg_diff / std_env
+            d_samples.append(d_value)
+            avg1_samples.append(avg1)
+            avg2_samples.append(avg2)
+            avg_diff_samples.append(avg_diff)
+            avg_diff_z_samples.append(avg_diff_z)
+
+        if not d_samples:
+            print(
+                f"[warn] No valid statistics computed for {env_path} across niche ensembles",
+                file=sys.stderr,
+            )
+            continue
+
+        d_summary = summarize_statistics(d_samples, lower_pct, upper_pct)
+        avg1_summary = summarize_statistics(avg1_samples, lower_pct, upper_pct)
+        avg2_summary = summarize_statistics(avg2_samples, lower_pct, upper_pct)
+        avg_diff_summary = summarize_statistics(avg_diff_samples, lower_pct, upper_pct)
+        avg_diff_z_summary = summarize_statistics(avg_diff_z_samples, lower_pct, upper_pct)
 
         output_path = output_dir / f"{env_path.stem}_overlap.png"
         if is_categorical:
+            if categories is None:
+                print(
+                    f"[warn] Unable to plot categorical overlap for {env_path}",
+                    file=sys.stderr,
+                )
+                continue
             plot_categorical_overlap(
                 categories,
                 dist1,
@@ -516,12 +756,19 @@ def process_layers(
                 f"{env_path.stem} - {niche1_name}",
                 f"{env_path.stem} - {niche2_name}",
                 str(env_path.stem),
-                d_value,
                 output_path,
-                avg1,
-                avg2,
+                avg1_summary,
+                avg2_summary,
+                d_summary,
+                category_labels,
             )
         else:
+            if bin_edges is None:
+                print(
+                    f"[warn] Unable to plot continuous overlap for {env_path}",
+                    file=sys.stderr,
+                )
+                continue
             plot_overlap(
                 bin_edges,
                 dist1,
@@ -529,13 +776,22 @@ def process_layers(
                 f"{env_path.stem} - {niche1_name}",
                 f"{env_path.stem} - {niche2_name}",
                 str(env_path.stem),
-                d_value,
                 output_path,
-                avg1,
-                avg2,
+                avg1_summary,
+                avg2_summary,
+                d_summary,
             )
         generated += 1
-        overlaps.append((env_path.stem, d_value, avg1, avg2, avg_diff, avg_diff_z))
+        overlaps.append(
+            OverlapResult(
+                variable=env_path.stem,
+                schoeners_d=d_summary,
+                avg_niche1=avg1_summary,
+                avg_niche2=avg2_summary,
+                avg_diff=avg_diff_summary,
+                avg_diff_z=avg_diff_z_summary,
+            )
+        )
         print(f"[ok] {output_path}")
 
     if generated == 0:
@@ -587,7 +843,7 @@ def save_difference_map(
 
 
 def write_overlap_table(
-    overlaps: Sequence[Tuple[str, float, float, float, float, float]],
+    overlaps: Sequence[OverlapResult],
     destination: Path,
     niche1_name: str,
     niche2_name: str,
@@ -600,22 +856,32 @@ def write_overlap_table(
     sheet.append(
         [
             "Variable",
-            "Schoener's D",
-            f"Avg {niche1_name}",
-            f"Avg {niche2_name}",
-            "AVG_diff",
-            "AVG_diff_zscore",
+            "Schoener's D (mean)",
+            "Schoener's D (CI low)",
+            "Schoener's D (CI high)",
+            f"Avg {niche1_name} (mean)",
+            f"Avg {niche1_name} (CI low)",
+            f"Avg {niche1_name} (CI high)",
+            f"Avg {niche2_name} (mean)",
+            f"Avg {niche2_name} (CI low)",
+            f"Avg {niche2_name} (CI high)",
+            "AVG_diff (mean)",
+            "AVG_diff (CI low)",
+            "AVG_diff (CI high)",
+            "AVG_diff_zscore (mean)",
+            "AVG_diff_zscore (CI low)",
+            "AVG_diff_zscore (CI high)",
         ]
     )
-    for variable, d_value, avg1, avg2, avg_diff, avg_diff_z in overlaps:
+    for overlap in overlaps:
         sheet.append(
             [
-                variable,
-                _format_number(d_value),
-                _format_number(avg1),
-                _format_number(avg2),
-                _format_number(avg_diff),
-                _format_number(avg_diff_z),
+                overlap.variable,
+                *_summary_cells(overlap.schoeners_d),
+                *_summary_cells(overlap.avg_niche1),
+                *_summary_cells(overlap.avg_niche2),
+                *_summary_cells(overlap.avg_diff),
+                *_summary_cells(overlap.avg_diff_z),
             ]
         )
     workbook.save(destination)
@@ -627,6 +893,14 @@ def _format_number(value: float) -> Optional[float]:
     return round(float(value), 6)
 
 
+def _summary_cells(summary: StatisticSummary) -> List[Optional[float]]:
+    return [
+        _format_number(summary.mean),
+        _format_number(summary.ci_low),
+        _format_number(summary.ci_high),
+    ]
+
+
 def _format_category_label(value: float) -> str:
     value_float = float(value)
     if value_float.is_integer():
@@ -634,23 +908,52 @@ def _format_category_label(value: float) -> str:
     return f"{value_float:g}"
 
 
+def load_category_labels(layer_path: Path) -> Optional[Dict[float, str]]:
+    label_path = layer_path.with_suffix(".labels")
+    if not label_path.exists():
+        return None
+    labels: Dict[float, str] = {}
+    try:
+        with label_path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.reader(handle)
+            for row in reader:
+                if len(row) < 2:
+                    continue
+                value_text = row[0].strip()
+                label_text = row[1].strip()
+                if not value_text:
+                    continue
+                try:
+                    value = float(value_text)
+                except ValueError:
+                    continue
+                labels[value] = label_text or value_text
+    except Exception as exc:  # pragma: no cover - defensive logging
+        print(f"[warn] Failed to read labels for {layer_path}: {exc}", file=sys.stderr)
+        return None
+    return labels or None
+
+
 def main() -> None:
     args = parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     categorical_layers = parse_categorical_layers(args.categorical)
-    niche1_raw = read_ascii_grid(args.niche1)
-    niche2_raw = read_ascii_grid(args.niche2)
-
-    niche1, niche2, bbox = align_niches(niche1_raw, niche2_raw)
+    niche1_members = load_niche_ensemble(args.niche1)
+    niche2_members = load_niche_ensemble(args.niche2)
+    niche1_aligned, niche2_aligned, bbox = align_niche_ensembles(niche1_members, niche2_members)
+    niche1_mean = average_ascii_grids(niche1_aligned)
+    niche2_mean = average_ascii_grids(niche2_aligned)
     niche1_name = args.niche1.stem
     niche2_name = args.niche2.stem
-    save_difference_map(niche1, niche2, args.output, niche1_name, niche2_name)
+    save_difference_map(niche1_mean, niche2_mean, args.output, niche1_name, niche2_name)
 
     env_layers = list_env_layers(args.enviro)
     overlaps = process_layers(
         env_layers,
-        niche1,
-        niche2,
+        niche1_aligned,
+        niche2_aligned,
+        niche1_mean,
+        niche2_mean,
         args.output,
         bbox,
         niche1_name,
