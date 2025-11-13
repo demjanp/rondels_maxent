@@ -140,6 +140,7 @@ def run_model(
 		"plots=true",
 		"writebackgroundpredictions=true",
 		"askoverwrite=false",
+		"threads=5",
 		"autorun",
 	]
 
